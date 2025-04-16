@@ -11,7 +11,7 @@ import json
 import threading
 
 # Bot token (replace with your own)
-BOT_TOKEN = "7575015472:AAE6RZZcJDeAMHaCMr62crpKULf5YJkq5Pw"
+BOT_TOKEN = "PASTE_YOUR_TOKEN_HERE"
 
 # States
 ASK_COUNT, ASK_PERCENT, ASK_TIME = range(3)
@@ -32,7 +32,7 @@ def home():
 
 @app.route('/ping')
 def ping():
-    return "pong"
+    return "pong", 200, {"Content-Type": "text/plain"}
 
 def start_flask():
     app.run(host='0.0.0.0', port=8080)
