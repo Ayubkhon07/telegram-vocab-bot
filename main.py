@@ -9,7 +9,7 @@ import math
 import json
 
 # Bot token (replace with your own)
-BOT_TOKEN = "PASTE_YOUR_TOKEN_HERE"
+BOT_TOKEN = "7575015472:AAE6RZZcJDeAMHaCMr62crpKULf5YJkq5Pw"
 
 # States
 ASK_COUNT, ASK_PERCENT, ASK_TIME = range(3)
