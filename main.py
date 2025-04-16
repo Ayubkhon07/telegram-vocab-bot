@@ -2,11 +2,13 @@ from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from flask import Flask
 from datetime import datetime
 from pytz import timezone
 from vocab_data import vocab_list
 import math
 import json
+import threading
 
 # Bot token (replace with your own)
 BOT_TOKEN = "7575015472:AAE6RZZcJDeAMHaCMr62crpKULf5YJkq5Pw"
@@ -20,6 +22,22 @@ tz = timezone("Asia/Tashkent")
 # Scheduler
 scheduler = BackgroundScheduler(timezone=tz)
 scheduler.start()
+
+# Flask server to keep bot alive
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running."
+
+@app.route('/ping')
+def ping():
+    return "pong"
+
+def start_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+threading.Thread(target=start_flask).start()
 
 # In-memory storage
 user_settings = {}
