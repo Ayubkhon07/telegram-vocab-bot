@@ -3,7 +3,11 @@ import json
 import math
 import threading
 from datetime import datetime, date
-from flask import Flask, request
+
+from flask import Flask
+from pytz import timezone
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from telegram import Update
 from telegram.ext import (
     Updater,
@@ -13,28 +17,18 @@ from telegram.ext import (
     CallbackContext,
     ConversationHandler,
 )
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-from pytz import timezone
-from vocab_data import vocab_list
+from vocab_data import vocab_list  # your 3000‑word list
 
-# ────── Configuration ──────
-# In Render set these two environment variables:
-#   BOT_TOKEN   = "7575015472:AAE6RZZcJDeAMHaCMr62crpKULf5YJkq5Pw"
-#   WEBHOOK_URL = "https://<YOUR_RENDER_SUBDOMAIN>.onrender.com/<BOT_TOKEN>"
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+# ─── CONFIG ──────────────────────────────────────────────────────────────────────
+BOT_TOKEN     = os.environ["BOT_TOKEN"]            # set this in Render/Env
+SETTINGS_FILE = "user_settings.json"               # stores { chat_id: {...} }
+TZ            = timezone("Asia/Tashkent")          # your target zone
+# ────────────────────────────────────────────────────────────────────────────────
 
-# ────── Conversation States ──────
+# Conversation states
 ASK_COUNT, ASK_PERCENT, ASK_TIME = range(3)
 
-# ────── Scheduler Setup ──────
-tz = timezone("Asia/Tashkent")
-scheduler = BackgroundScheduler(timezone=tz)
-scheduler.start()
-
-# ────── Persistence ──────
-SETTINGS_FILE = "user_settings.json"
+# Load (or init) persistent settings
 if os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
         user_settings = json.load(f)
@@ -45,148 +39,144 @@ def save_settings():
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(user_settings, f)
 
-# ────── Vocabulary Delivery ──────
+# ─── SCHEDULER ──────────────────────────────────────────────────────────────────
+scheduler = BackgroundScheduler(timezone=TZ)
+scheduler.start()
+
 def send_words(context: CallbackContext, chat_id: int):
+    """Actually send the next batch of words, advance position, save."""
     cid = str(chat_id)
-    try:
-        count = user_settings[cid]["count"]
-        pos   = user_settings[cid].get("position", 0)
-        next_pos = min(pos + count, len(vocab_list))
-        words = vocab_list[pos:next_pos]
+    info = user_settings.get(cid)
+    if not info:
+        return  # no settings
 
-        # update position & last_sent
-        user_settings[cid]["position"] = next_pos
-        user_settings[cid]["last_sent"] = date.today().isoformat()
-        save_settings()
+    count    = info["count"]
+    pos      = info.get("position", 0)
+    next_pos = min(pos + count, len(vocab_list))
+    batch    = vocab_list[pos:next_pos]
 
-        # send the batch
-        if context:
-            context.bot.send_message(chat_id=int(cid), text="\n".join(words))
+    # update settings
+    info["position"]  = next_pos
+    info["last_sent"] = date.today().isoformat()
+    save_settings()
 
-        print(f"[Sent] {cid} → words {pos}-{next_pos}")
-    except Exception as e:
-        print(f"[Error sending to {cid}] {e}")
+    # send
+    text = "\n".join(batch)
+    context.bot.send_message(chat_id=chat_id, text=text)
 
-# ────── Flask App for Webhook & Ping ──────
+# On startup, re‑schedule existing jobs & catch up if missed
+for cid, info in list(user_settings.items()):
+    if all(k in info for k in ("time", "count", "position")):
+        hh, mm = map(int, info["time"].split(":"))
+        trigger = CronTrigger(hour=hh, minute=mm, timezone=TZ)
+        scheduler.add_job(send_words, trigger,
+                          args=[None, int(cid)],
+                          id=str(cid), replace_existing=True)
+
+        # catch‑up: if now past today’s send time and we haven’t sent yet today
+        now   = datetime.now(TZ)
+        today = date.today().isoformat()
+        if now.time() >= datetime.now(TZ).replace(hour=hh, minute=mm).time():
+            if info.get("last_sent") != today:
+                print(f"[catch‑up] sending for {cid}")
+                send_words(None, int(cid))
+
+# ─── FLASK KEEPALIVE ───────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running."
+    return "Bot is alive!"
 
 @app.route("/ping")
 def ping():
     return "pong", 200, {"Content-Type": "text/plain"}
 
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook_handler():
-    update = Update.de_json(request.get_json(force=True), updater.bot)
-    updater.dispatcher.process_update(update)
-    return "OK"
-
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    app.run(host="0.0.0.0", port=8080)
 
 threading.Thread(target=run_flask, daemon=True).start()
 
-# ────── Reschedule & Catch‑Up on Startup ──────
-for chat_id, info in user_settings.items():
-    if {"time", "count", "position"}.issubset(info):
-        # schedule daily job
-        t_obj = datetime.strptime(info["time"], "%H:%M").time()
-        trigger = CronTrigger(hour=t_obj.hour, minute=t_obj.minute, timezone=tz)
-        scheduler.add_job(send_words, trigger, args=[None, int(chat_id)],
-                          id=str(chat_id), replace_existing=True)
-
-        # catch‑up if missed today
-        now = datetime.now(tz)
-        if (now.time() >= t_obj) and info.get("last_sent") != date.today().isoformat():
-            print(f"[Catch‑Up] Missed {chat_id}, sending now...")
-            send_words(None, int(chat_id))
-
-# ────── Bot Handlers ──────
+# ─── BOT HANDLERS ──────────────────────────────────────────────────────────────
 def start(update: Update, context: CallbackContext):
     update.message.reply_text("Nechta so‘z olishni xohlaysiz?")
     return ASK_COUNT
 
 def ask_percent(update: Update, context: CallbackContext):
-    chat_id = str(update.message.chat_id)
+    cid = str(update.effective_chat.id)
     try:
-        count = int(update.message.text.strip())
-        user_settings[chat_id] = {"count": count}
-        save_settings()
-        update.message.reply_text("Taxminan necha foizini o‘rgandingiz? (Masalan: 30)")
-        return ASK_PERCENT
+        cnt = int(update.message.text.strip())
     except ValueError:
-        update.message.reply_text("Iltimos, son kiriting.")
+        update.message.reply_text("Iltimos, to‘g‘ri son kiriting.")
         return ASK_COUNT
 
+    user_settings[cid] = {"count": cnt}
+    update.message.reply_text("Taxminan necha foizini o‘rgandingiz? (Masalan: 30)")
+    return ASK_PERCENT
+
 def ask_time(update: Update, context: CallbackContext):
-    chat_id = str(update.message.chat_id)
+    cid = str(update.effective_chat.id)
     try:
-        percent = float(update.message.text.strip())
-        total_words = len(vocab_list)
-        start_index = min(math.floor(total_words * percent / 100), total_words - 1)
-        user_settings[chat_id]["position"] = start_index
-        save_settings()
-        update.message.reply_text("Qaysi vaqtda yuboray? (Format: HH:MM, 24 soat)")
-        return ASK_TIME
+        pct        = float(update.message.text.strip())
+        total      = len(vocab_list)
+        start_idx  = min(math.floor(total * pct / 100), total - 1)
     except ValueError:
-        update.message.reply_text("Iltimos, faqat raqamli foiz kiriting.")
+        update.message.reply_text("Iltimos, faqat raqam kiriting.")
         return ASK_PERCENT
 
+    user_settings[cid]["position"] = start_idx
+    update.message.reply_text("Qaysi vaqtda yuboray? (Format: HH:MM, 24 soat)")
+    return ASK_TIME
+
 def confirm_settings(update: Update, context: CallbackContext):
-    chat_id = str(update.message.chat_id)
+    cid = str(update.effective_chat.id)
+    txt = update.message.text.strip()
     try:
-        send_time = datetime.strptime(update.message.text.strip(), "%H:%M").time()
-        user_settings[chat_id]["time"] = send_time.strftime("%H:%M")
-        save_settings()
-
-        trigger = CronTrigger(hour=send_time.hour, minute=send_time.minute, timezone=tz)
-        scheduler.add_job(send_words, trigger, args=[context, int(chat_id)],
-                          id=chat_id, replace_existing=True)
-
-        count = user_settings[chat_id]["count"]
-        pos   = user_settings[chat_id]["position"]
-        update.message.reply_text(
-            f"Har kuni {count} ta so‘z yuboraman. Boshlanish: {pos+1}-chi so‘zdan, soat {send_time.strftime('%H:%M')} da."
-        )
-        print(f"[Scheduled] {chat_id} → from index {pos}, at {send_time}")
-        return ConversationHandler.END
-    except ValueError:
-        update.message.reply_text("Vaqt formati noto‘g‘ri. Masalan: 16:00")
+        hh, mm = map(int, txt.split(":"))
+    except:
+        update.message.reply_text("Vaqt formatini tekshirib qayta kiriting (Mas: 16:00).")
         return ASK_TIME
+
+    # save time
+    user_settings[cid]["time"] = f"{hh:02d}:{mm:02d}"
+    save_settings()
+
+    # schedule
+    trigger = CronTrigger(hour=hh, minute=mm, timezone=TZ)
+    scheduler.add_job(send_words, trigger,
+                      args=[context, int(cid)],
+                      id=cid, replace_existing=True)
+
+    cnt = user_settings[cid]["count"]
+    pos = user_settings[cid]["position"]
+    update.message.reply_text(
+        f"Har kuni {cnt} ta so‘z yuboraman, boshlanish: {pos+1}-chi so‘zdan, soat {hh:02d}:{mm:02d}."
+    )
+    return ConversationHandler.END
 
 def cancel(update: Update, context: CallbackContext):
     update.message.reply_text("Bekor qilindi.")
     return ConversationHandler.END
 
-# ────── Main ──────
+# ─── MAIN ENTRYPOINT ───────────────────────────────────────────────────────────
 def main():
-    global updater
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            ASK_COUNT:  [MessageHandler(Filters.text & ~Filters.command, ask_percent)],
-            ASK_PERCENT:[MessageHandler(Filters.text & ~Filters.command, ask_time)],
-            ASK_TIME:   [MessageHandler(Filters.text & ~Filters.command, confirm_settings)],
+            ASK_COUNT:   [MessageHandler(Filters.text & ~Filters.command, ask_percent)],
+            ASK_PERCENT: [MessageHandler(Filters.text & ~Filters.command, ask_time)],
+            ASK_TIME:    [MessageHandler(Filters.text & ~Filters.command, confirm_settings)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
     dp.add_handler(conv)
 
-    # start webhook instead of polling
-    updater.start_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 8080)),
-        url_path=BOT_TOKEN,
-    )
-    updater.bot.set_webhook(WEBHOOK_URL)
-
-    print("[Bot Started via Webhook]")
+    print("[Bot Started: using long‑polling]")
+    updater.start_polling()
     updater.idle()
 
 if __name__ == "__main__":
